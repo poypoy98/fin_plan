@@ -7,7 +7,7 @@ Requirements:
 pip install pdfplumber
 
 Output columns:
-Source PDF|Date|Transaction details|Amount (A$)
+Source PDF|Date|Financial Year|Month|Transaction details|Amount (A$)
 """
 
 from __future__ import annotations
@@ -28,10 +28,12 @@ CONFIG = {
         r"C:\Users\azira\OneDrive\Documents\Finance\00 FIRE\CreditCard Statements\xx1197",
         r"C:\Users\azira\OneDrive\Documents\Finance\00 FIRE\CreditCard Statements\xx6329"
     ],
-    "DEFAULT_OUTPUT_FILE": "credit_cards_trxns.csv",
+    "DEFAULT_OUTPUT_FILE": "credit_cards_trxns.txt",
     "CSV_COLUMNS": [
         "Source PDF",
         "Date",
+        "Financial Year",
+        "Month",
         "Transaction details",
         "Amount (A$)",
     ],
@@ -77,9 +79,11 @@ TRANSACTION_ROW_RE = re.compile(
 
 
 def normalise_space(value: object) -> str:
+    """Replace newlines and tabs with spaces, then collapse multiple spaces."""
     if value is None:
         return ""
-    return re.sub(r"\s+", " ", str(value).replace("\n", " ")).strip()
+    cleaned_str = str(value).replace("\n", " ").replace("\t", " ")
+    return re.sub(r"\s+", " ", cleaned_str).strip()
 
 
 def normalise_amount(amount: str) -> str:
@@ -133,6 +137,22 @@ def convert_statement_date(
         year = statement_start.year
 
     return datetime(year, month, day).strftime("%d-%m-%Y")
+
+
+def calculate_financial_year(date_str: str) -> str:
+    """
+    Calculate the Australian Financial Year ending year from a 'DD-MM-YYYY' date string.
+    Example: '08-08-2020' -> '2021', '10-02-2021' -> '2021'
+    """
+    dt = datetime.strptime(date_str, "%d-%m-%Y")
+    fy_year = dt.year + 1 if dt.month >= 7 else dt.year
+    return str(fy_year)
+
+
+def extract_month_number(date_str: str) -> str:
+    """Extract 2-digit numerical month string from a 'DD-MM-YYYY' date string."""
+    dt = datetime.strptime(date_str, "%d-%m-%Y")
+    return f"{dt.month:02d}"
 
 
 def looks_like_non_transaction(text: str) -> bool:
@@ -234,8 +254,15 @@ def parse_transaction_cells(
     else:
         details = normalise_space(date_match.group("rest"))
 
+    details = normalise_space(details.replace("\t", " "))
+
+    financial_year = calculate_financial_year(statement_date)
+    month_num = extract_month_number(statement_date)
+
     return {
         "Date": statement_date,
+        "Financial Year": financial_year,
+        "Month": month_num,
         "Transaction details": details,
         "Amount (A$)": normalise_amount(amount_text),
     }

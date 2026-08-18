@@ -17,16 +17,16 @@ import csv
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Set
+from typing import Iterable, Optional, Sequence, Set
 
 import pdfplumber
 
-# Consolidated configuration dictionary
+# Global configuration dictionary
 CONFIG = {
     "DEFAULT_SOURCE_DIRS": [
         r"C:\Users\azira\OneDrive\Documents\Finance\00 FIRE\CreditCard Statements\xx5485",
         r"C:\Users\azira\OneDrive\Documents\Finance\00 FIRE\CreditCard Statements\xx1197",
-        r"C:\Users\azira\OneDrive\Documents\Finance\00 FIRE\CreditCard Statements\xx6329"
+        r"C:\Users\azira\OneDrive\Documents\Finance\00 FIRE\CreditCard Statements\xx6329",
     ],
     "DEFAULT_OUTPUT_FILE": "credit_cards_trxns.txt",
     "CSV_COLUMNS": [
@@ -64,101 +64,9 @@ CONFIG = {
         "min_words_vertical": 3,
         "min_words_horizontal": 1,
     },
-}
-
-AMOUNT_RE = re.compile(
-    r"\$?-?\d{1,3}(?:,\d{3})*\.\d{2}-?|\$?-?\d+\.\d{2}-?"
-)
-
-TRANSACTION_ROW_RE = re.compile(
-    rf"^(?P<date>\d{{1,2}}\s+(?:{CONFIG['MONTHS']}))\s+"
-    rf"(?P<details>.+?)\s+"
-    rf"(?P<amount>{AMOUNT_RE.pattern})$",
-    re.IGNORECASE,
-)
-
-
-def normalise_space(value: object) -> str:
-    """Replace newlines and tabs with spaces, then collapse multiple spaces."""
-    if value is None:
-        return ""
-    cleaned_str = str(value).replace("\n", " ").replace("\t", " ")
-    return re.sub(r"\s+", " ", cleaned_str).strip()
-
-
-def normalise_amount(amount: str) -> str:
-    amount = amount.replace("$", "").replace(",", "").strip()
-    if amount.endswith("-"):
-        amount = "-" + amount[:-1]
-    return amount
-
-
-def extract_statement_period(pdf: pdfplumber.PDF) -> tuple[Optional[datetime], Optional[datetime]]:
-    """Extract statement start/end dates from first page."""
-    if not pdf.pages:
-        return None, None
-
-    page1_text = pdf.pages[0].extract_text() or ""
-    match = re.search(
-        r"Statement Period\s+"
-        r"(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})\s*-\s*"
-        r"(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
-        page1_text,
-        re.IGNORECASE,
-    )
-
-    if not match:
-        return None, None
-
-    try:
-        start_date = datetime.strptime(match.group(1), "%d %b %Y")
-        end_date = datetime.strptime(match.group(2), "%d %b %Y")
-        return start_date, end_date
-    except ValueError:
-        return None, None
-
-
-def convert_statement_date(
-    date_text: str,
-    statement_start: Optional[datetime],
-    statement_end: Optional[datetime],
-) -> str:
-    """Convert '08 Dec' to '08-12-2020' using statement context."""
-    parts = date_text.split()
-    day = int(parts[0])
-    month_text = parts[1].title()
-    month = CONFIG["MONTH_MAP"].get(month_text, 1)
-
-    if not statement_start or not statement_end:
-        year = 2000
-    elif statement_start.year != statement_end.year:
-        year = statement_start.year if month >= statement_start.month else statement_end.year
-    else:
-        year = statement_start.year
-
-    return datetime(year, month, day).strftime("%d-%m-%Y")
-
-
-def calculate_financial_year(date_str: str) -> str:
-    """
-    Calculate the Australian Financial Year ending year from a 'DD-MM-YYYY' date string.
-    Example: '08-08-2020' -> '2021', '10-02-2021' -> '2021'
-    """
-    dt = datetime.strptime(date_str, "%d-%m-%Y")
-    fy_year = dt.year + 1 if dt.month >= 7 else dt.year
-    return str(fy_year)
-
-
-def extract_month_number(date_str: str) -> str:
-    """Extract 2-digit numerical month string from a 'DD-MM-YYYY' date string."""
-    dt = datetime.strptime(date_str, "%d-%m-%Y")
-    return f"{dt.month:02d}"
-
-
-def looks_like_non_transaction(text: str) -> bool:
-    lower = text.lower()
-    exclusions = [
+    "EXCLUSION_PHRASES": (
         "transactions date transaction details",
+        "date transaction details amount",
         "interest charged on purchases",
         "interest charged on cash advances",
         "purchase rate",
@@ -171,12 +79,116 @@ def looks_like_non_transaction(text: str) -> bool:
         "points earned",
         "total points balance",
         "mastercard is the registered trademark",
-    ]
-    return any(x in lower for x in exclusions)
+        "payment summary",
+    ),
+}
+
+# Pre-compiled regular expressions for performance
+AMOUNT_RE = re.compile(
+    r"\$?-?\d{1,3}(?:,\d{3})*(?:\.|\s)\d{2}-?"
+    r"|\$?-?\d+(?:\.|\s)\d{2}-?"
+)
+
+DATE_MATCH_RE = re.compile(
+    rf"^(?P<date>\d{{1,2}}\s+(?:{CONFIG['MONTHS']}))\b(?P<rest>.*)$",
+    re.IGNORECASE,
+)
+
+STATEMENT_PERIOD_RE = re.compile(
+    r"Statement\s*Period\s*"
+    r"(?P<start_day>\d{1,2})\s*"
+    r"(?P<start_mon>[A-Za-z]{3})\s*"
+    r"(?P<start_year>\d{4})\s*-\s*"
+    r"(?P<end_day>\d{1,2})\s*"
+    r"(?P<end_mon>[A-Za-z]{3})\s*"
+    r"(?P<end_year>\d{4})",
+    re.IGNORECASE,
+)
+
+
+def normalise_space(value: object) -> str:
+    """Replace newlines/tabs with spaces and collapse multi-space sequences."""
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value).replace("\n", " ").replace("\t", " ")).strip()
+
+
+def normalise_amount(amount: str) -> str:
+    """Normalise extracted amount text to signed decimal format."""
+    amount = amount.replace("$", "").replace(",", "").strip()
+    is_negative = amount.startswith("-") or amount.endswith("-")
+    amount = amount.strip("-").strip()
+
+    # Repair whitespace decimal points (e.g., "40 00" -> "40.00")
+    amount = re.sub(r"^(\d+)\s+(\d{2})$", r"\1.\2", amount).replace(" ", "")
+
+    return f"-{amount}" if is_negative else amount
+
+
+def extract_statement_period(pdf: pdfplumber.PDF) -> tuple[Optional[datetime], Optional[datetime]]:
+    """Extract statement start and end dates from page 1."""
+    if not pdf.pages:
+        return None, None
+
+    page1_text = pdf.pages[0].extract_text() or ""
+    match = STATEMENT_PERIOD_RE.search(page1_text)
+
+    if not match:
+        return None, None
+
+    try:
+        start_date = datetime.strptime(
+            f"{match.group('start_day')} {match.group('start_mon')} {match.group('start_year')}".title(),
+            "%d %b %Y",
+        )
+        end_date = datetime.strptime(
+            f"{match.group('end_day')} {match.group('end_mon')} {match.group('end_year')}".title(),
+            "%d %b %Y",
+        )
+        return start_date, end_date
+    except ValueError:
+        return None, None
+
+
+def parse_statement_date(
+    date_text: str,
+    statement_start: Optional[datetime],
+    statement_end: Optional[datetime],
+) -> datetime:
+    """Parse string date (e.g. '09 Apr') directly into a datetime object using statement context."""
+    parts = date_text.split()
+    day = int(parts[0])
+    month = CONFIG["MONTH_MAP"].get(parts[1].title(), 1)
+
+    if not statement_start or not statement_end:
+        year = 2000
+    elif statement_start.year != statement_end.year:
+        year = statement_start.year if month >= statement_start.month else statement_end.year
+    else:
+        year = statement_start.year
+
+    return datetime(year, month, day)
+
+
+def calculate_financial_year(dt: datetime) -> str:
+    """Calculate the Australian financial year ending year from a datetime object."""
+    return str(dt.year + 1 if dt.month >= 7 else dt.year)
+
+
+def extract_month_number(dt: datetime) -> str:
+    """Extract 2-digit month string from a datetime object."""
+    return f"{dt.month:02d}"
+
+
+def looks_like_non_transaction(text: str) -> bool:
+    """Check if row text matches standard statement headers or summary rows."""
+    lower = text.lower()
+    return any(phrase in lower for phrase in CONFIG["EXCLUSION_PHRASES"])
 
 
 def smart_join_detail_parts(parts: Sequence[str]) -> str:
-    cleaned = [normalise_space(x) for x in parts if normalise_space(x)]
+    """Join split merchant description fragments."""
+    cleaned = [normalise_space(part) for part in parts if normalise_space(part)]
     if not cleaned:
         return ""
 
@@ -196,30 +208,45 @@ def parse_transaction_cells(
     statement_start: Optional[datetime],
     statement_end: Optional[datetime],
 ) -> Optional[dict[str, str]]:
-    cells = [normalise_space(c) for c in row if normalise_space(c)]
-    if not cells:
-        return None
-
-    joined = " ".join(cells)
-    if looks_like_non_transaction(joined):
+    """Parse raw table cells into a structured transaction dictionary."""
+    cells = [normalise_space(cell) for cell in row if normalise_space(cell)]
+    if not cells or looks_like_non_transaction(" ".join(cells)):
         return None
 
     amount_index = None
     amount_text = None
+    residual_override = None
 
-    for i in range(len(cells) - 1, -1, -1):
-        match = AMOUNT_RE.search(cells[i])
+    # Identify right-most amount
+    for index in range(len(cells) - 1, -1, -1):
+        match = AMOUNT_RE.search(cells[index])
         if match:
-            amount_index = i
+            amount_index = index
             amount_text = match.group(0)
             break
+
+        # Handle split amounts across adjacent cells
+        if index > 0 and re.fullmatch(r"\d{2}-?", cells[index]):
+            previous_cell = cells[index - 1]
+            previous_match = re.search(
+                r"(?P<prefix>.*?)(?P<dollars>\d{1,3}(?:,\d{3})*|\d+)$",
+                previous_cell,
+            )
+            if previous_match:
+                amount_index = index - 1
+                amount_text = f"{previous_match.group('dollars')} {cells[index]}"
+                residual_override = normalise_space(previous_match.group("prefix"))
+                break
 
     if amount_index is None or amount_text is None:
         return None
 
     left_cells = cells[:amount_index]
-    amount_pos = cells[amount_index].rfind(amount_text)
-    residual = normalise_space(cells[amount_index][:amount_pos])
+    if residual_override is not None:
+        residual = residual_override
+    else:
+        amount_pos = cells[amount_index].rfind(amount_text)
+        residual = normalise_space(cells[amount_index][:amount_pos])
 
     if residual:
         left_cells.append(residual)
@@ -227,93 +254,67 @@ def parse_transaction_cells(
     if not left_cells:
         return None
 
-    text = " ".join(left_cells)
-    date_match = re.match(
-        rf"^(?P<date>\d{{1,2}}\s+(?:{CONFIG['MONTHS']}))\b(?P<rest>.*)$",
-        text,
-        re.IGNORECASE,
-    )
-
+    text = normalise_space(" ".join(left_cells))
+    date_match = DATE_MATCH_RE.match(text)
     if not date_match:
         return None
 
-    statement_date = convert_statement_date(
-        date_match.group("date"),
-        statement_start,
-        statement_end,
-    )
+    dt = parse_statement_date(date_match.group("date"), statement_start, statement_end)
 
-    first_cell = re.match(
-        rf"^(\d{{1,2}}\s+(?:{CONFIG['MONTHS']}))\b(?P<rest>.*)$",
-        left_cells[0],
-        re.IGNORECASE,
-    )
-
+    first_cell = DATE_MATCH_RE.match(left_cells[0])
     if first_cell:
         details = smart_join_detail_parts([first_cell.group("rest")] + left_cells[1:])
     else:
         details = normalise_space(date_match.group("rest"))
 
-    details = normalise_space(details.replace("\t", " "))
-
-    financial_year = calculate_financial_year(statement_date)
-    month_num = extract_month_number(statement_date)
-
     return {
-        "Date": statement_date,
-        "Financial Year": financial_year,
-        "Month": month_num,
-        "Transaction details": details,
+        "Date": dt.strftime("%d-%m-%Y"),
+        "Financial Year": calculate_financial_year(dt),
+        "Month": extract_month_number(dt),
+        "Transaction details": normalise_space(details),
         "Amount (A$)": normalise_amount(amount_text),
     }
 
 
 def table_contains_transaction(table: Sequence[Sequence[object]]) -> bool:
-    for row in table:
-        if parse_transaction_cells(row, datetime(2000, 1, 1), datetime(2000, 1, 1)):
-            return True
-    return False
+    """Determine if an extracted table contains valid transactions."""
+    dummy_dt = datetime(2000, 1, 1)
+    return any(parse_transaction_cells(row, dummy_dt, dummy_dt) for row in table)
 
 
 def get_tables(page: pdfplumber.page.Page) -> list:
-    width = page.width
-    height = page.height
-
-    cropped = page.crop((45, 90, width - 20, height - 65))
+    """Extract candidate tables using explicit lines first, falling back to text strategy."""
+    cropped = page.crop((45, 90, page.width - 20, page.height - 65))
 
     explicit_tables = cropped.extract_tables(CONFIG["EXPLICIT_TABLE_SETTINGS"]) or []
-    for t in explicit_tables:
-        if table_contains_transaction(t):
-            return explicit_tables
+    if any(table_contains_transaction(t) for t in explicit_tables):
+        return explicit_tables
 
     return cropped.extract_tables(CONFIG["TEXT_TABLE_SETTINGS"]) or []
 
 
 def extract_transactions(pdf_path: Path) -> list[dict[str, str]]:
+    """Process a single PDF file and extract all contained transactions."""
     transactions = []
 
-    with pdfplumber.open(pdf_path) as pdf:
-        statement_start, statement_end = extract_statement_period(pdf)
-
-        for page in pdf.pages:
-            for table in get_tables(page):
-                for row in table:
-                    txn = parse_transaction_cells(
-                        row,
-                        statement_start,
-                        statement_end,
-                    )
-                    if not txn:
-                        continue
-
-                    txn["Source PDF"] = pdf_path.name
-                    transactions.append(txn)
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            statement_start, statement_end = extract_statement_period(pdf)
+            for page in pdf.pages:
+                for table in get_tables(page):
+                    for row in table:
+                        txn = parse_transaction_cells(row, statement_start, statement_end)
+                        if txn:
+                            txn["Source PDF"] = pdf_path.name
+                            transactions.append(txn)
+    except Exception as exc:
+        print(f"Error processing {pdf_path.name}: {exc}")
 
     return transactions
 
 
 def iter_pdf_files(source_dirs: Iterable[Path]) -> Iterable[Path]:
-    """Find all unique PDF files across multiple source directories."""
+    """Yield unique PDF files across specified directories."""
     seen_files: Set[Path] = set()
 
     for source_dir in source_dirs:
@@ -321,7 +322,7 @@ def iter_pdf_files(source_dirs: Iterable[Path]) -> Iterable[Path]:
             print(f"Warning: Directory not found, skipping: {source_dir}")
             continue
 
-        for pdf_file in sorted(source_dir.rglob("*.pdf"), key=lambda x: str(x).lower()):
+        for pdf_file in sorted(source_dir.rglob("*.pdf"), key=lambda p: str(p).lower()):
             resolved_path = pdf_file.resolve()
             if resolved_path not in seen_files:
                 seen_files.add(resolved_path)
@@ -329,9 +330,10 @@ def iter_pdf_files(source_dirs: Iterable[Path]) -> Iterable[Path]:
 
 
 def write_output(rows: list[dict[str, str]], output_file: str | Path) -> None:
-    with open(output_file, "w", encoding="utf-8-sig", newline="") as f:
+    """Write extracted dictionary rows to a pipe-delimited output file."""
+    with open(output_file, "w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(
-            f,
+            handle,
             fieldnames=CONFIG["CSV_COLUMNS"],
             delimiter="|",
             extrasaction="ignore",
@@ -342,14 +344,14 @@ def write_output(rows: list[dict[str, str]], output_file: str | Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Extract PDF statement transactions from multiple directories into a single PSV."
+        description="Extract PDF statement transactions into a single PSV file."
     )
     parser.add_argument(
         "--source",
         nargs="+",
         action="extend",
         default=None,
-        help="One or more source directory paths. Overrides defaults if supplied.",
+        help="One or more source directory paths.",
     )
     parser.add_argument(
         "--output",
@@ -358,8 +360,6 @@ def main() -> None:
     )
 
     args = parser.parse_args()
-
-    # Use CLI sources if provided, otherwise fall back to CONFIG defaults
     source_paths = args.source if args.source else CONFIG["DEFAULT_SOURCE_DIRS"]
     source_dirs = [Path(p) for p in source_paths]
 
@@ -374,10 +374,11 @@ def main() -> None:
 
     write_output(all_rows, args.output)
 
-    print()
-    print(f"Processed {processed_count} PDF files across {len(source_dirs)} folder(s).")
-    print(f"Total transactions extracted: {len(all_rows)}")
-    print(f"Output file created: {args.output}")
+    print(
+        f"\nProcessed {processed_count} PDF file(s) across {len(source_dirs)} directory location(s).\n"
+        f"Total transactions extracted: {len(all_rows)}\n"
+        f"Output written to: {args.output}"
+    )
 
 
 if __name__ == "__main__":
